@@ -1,0 +1,1 @@
+VOLC_KEYS_CONFIG: str = '[{"key_id":"tiyan01","app_key":"5908854963","access_key":"hEHVg2S8fpg3ih9zmsELOzmGbMP89DWy","max_concurrent":3},{"key_id":"tiyan02","app_key":"1271279660","access_key":"lezyzPsQ68J3ZtR5CbOkTPrZe1ZDyM6f","max_concurrent":3},{"key_id":"tiyan03","app_key":"8581953827","access_key":"UMlqA_Anul815mC8M5nj2kKXtOGlUV29","max_concurrent":3}]'
