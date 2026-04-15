@@ -8,12 +8,8 @@ import logging
 import os
 import subprocess
 from typing import Optional, List, Dict, Any, Tuple, AsyncGenerator
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
-from config import VOLC_KEYS_CONFIG
 
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -24,6 +20,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 常量定义
 DEFAULT_SAMPLE_RATE = 16000
 
 class ProtocolVersion:
@@ -47,6 +44,25 @@ class SerializationType:
 
 class CompressionType:
     GZIP = 0b0001
+
+
+class Config:
+    def __init__(self):
+        # 填入控制台获取的app id和access token
+        self.auth = {
+            "app_key": "xxxxxxx",
+            "access_key": "xxxxxxxxxxxx"
+        }
+
+    @property
+    def app_key(self) -> str:
+        return self.auth["app_key"]
+
+    @property
+    def access_key(self) -> str:
+        return self.auth["access_key"]
+
+config = Config()
 
 class CommonUtils:
     @staticmethod
@@ -72,6 +88,13 @@ class CommonUtils:
                 "-f", "wav", "-"
             ]
             result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # 尝试删除原始文件
+            try:
+                os.remove(audio_path)
+            except OSError as e:
+                logger.warning(f"Failed to remove original file: {e}")
+                
             return result.stdout
         except subprocess.CalledProcessError as e:
             logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
@@ -82,6 +105,7 @@ class CommonUtils:
         if len(data) < 44:
             raise ValueError("Invalid WAV file: too short")
             
+        # 解析WAV头
         chunk_id = data[:4]
         if chunk_id != b'RIFF':
             raise ValueError("Invalid WAV file: not RIFF format")
@@ -90,11 +114,13 @@ class CommonUtils:
         if format_ != b'WAVE':
             raise ValueError("Invalid WAV file: not WAVE format")
             
+        # 解析fmt子块
         audio_format = struct.unpack('<H', data[20:22])[0]
         num_channels = struct.unpack('<H', data[22:24])[0]
         sample_rate = struct.unpack('<I', data[24:28])[0]
         bits_per_sample = struct.unpack('<H', data[34:36])[0]
         
+        # 查找data子块
         pos = 36
         while pos < len(data) - 8:
             subchunk_id = data[pos:pos+4]
@@ -154,17 +180,17 @@ class AsrRequestHeader:
 
 class RequestBuilder:
     @staticmethod
-    def new_auth_headers(app_key: str, access_key: str) -> Dict[str, str]:
+    def new_auth_headers() -> Dict[str, str]:
         reqid = str(uuid.uuid4())
         return {
             "X-Api-Resource-Id": "volc.bigasr.sauc.duration",
             "X-Api-Request-Id": reqid,
-            "X-Api-Access-Key": access_key,
-            "X-Api-App-Key": app_key
+            "X-Api-Access-Key": config.access_key,
+            "X-Api-App-Key": config.app_key
         }
 
     @staticmethod
-    def new_full_client_request(seq: int) -> bytes:
+    def new_full_client_request(seq: int) -> bytes:  # 添加seq参数
         header = AsrRequestHeader.default_header() \
             .with_message_type_specific_flags(MessageTypeSpecificFlags.POS_SEQUENCE)
         
@@ -195,7 +221,7 @@ class RequestBuilder:
         
         request = bytearray()
         request.extend(header.to_bytes())
-        request.extend(struct.pack('>i', seq))
+        request.extend(struct.pack('>i', seq))  # 使用传入的seq
         request.extend(struct.pack('>I', payload_size))
         request.extend(compressed_payload)
         
@@ -204,9 +230,9 @@ class RequestBuilder:
     @staticmethod
     def new_audio_only_request(seq: int, segment: bytes, is_last: bool = False) -> bytes:
         header = AsrRequestHeader.default_header()
-        if is_last:
+        if is_last:  # 最后一个包特殊处理
             header.with_message_type_specific_flags(MessageTypeSpecificFlags.NEG_WITH_SEQUENCE)
-            seq = -seq
+            seq = -seq  # 设为负值
         else:
             header.with_message_type_specific_flags(MessageTypeSpecificFlags.POS_SEQUENCE)
         header.with_message_type(MessageType.CLIENT_AUDIO_ONLY_REQUEST)
@@ -253,6 +279,7 @@ class ResponseParser:
         
         payload = msg[header_size*4:]
         
+        # 解析message_type_specific_flags
         if message_type_specific_flags & 0x01:
             response.payload_sequence = struct.unpack('>i', payload[:4])[0]
             payload = payload[4:]
@@ -262,6 +289,7 @@ class ResponseParser:
             response.event = struct.unpack('>i', payload[:4])[0]
             payload = payload[4:]
             
+        # 解析message_type
         if message_type == MessageType.SERVER_FULL_RESPONSE:
             response.payload_size = struct.unpack('>I', payload[:4])[0]
             payload = payload[4:]
@@ -273,6 +301,7 @@ class ResponseParser:
         if not payload:
             return response
             
+        # 解压缩
         if message_compression == CompressionType.GZIP:
             try:
                 payload = CommonUtils.gzip_decompress(payload)
@@ -280,6 +309,7 @@ class ResponseParser:
                 logger.error(f"Failed to decompress payload: {e}")
                 return response
                 
+        # 解析payload
         try:
             if serialization_method == SerializationType.JSON:
                 response.payload_msg = json.loads(payload.decode('utf-8'))
@@ -289,14 +319,12 @@ class ResponseParser:
         return response
 
 class AsrWsClient:
-    def __init__(self, url: str, app_key: str, access_key: str, segment_duration: int = 200):
+    def __init__(self, url: str, segment_duration: int = 200):
         self.seq = 1
         self.url = url
-        self.app_key = app_key
-        self.access_key = access_key
         self.segment_duration = segment_duration
         self.conn = None
-        self.session = None
+        self.session = None  # 添加session引用
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -333,20 +361,20 @@ class AsrWsClient:
             raise
             
     async def create_connection(self) -> None:
-        headers = RequestBuilder.new_auth_headers(self.app_key, self.access_key)
+        headers = RequestBuilder.new_auth_headers()
         try:
-            self.conn = await self.session.ws_connect(
+            self.conn = await self.session.ws_connect(  # 使用self.session
                 self.url,
                 headers=headers
             )
-            logger.info(f"Connected to {self.url} with app_key: {self.app_key}")
+            logger.info(f"Connected to {self.url}")
         except Exception as e:
             logger.error(f"Failed to connect to WebSocket: {e}")
             raise
             
     async def send_full_client_request(self) -> None:
         request = RequestBuilder.new_full_client_request(self.seq)
-        self.seq += 1
+        self.seq += 1  # 发送后递增
         try:
             await self.conn.send_bytes(request)
             logger.info(f"Sent full client request with seq: {self.seq-1}")
@@ -378,7 +406,8 @@ class AsrWsClient:
             if not is_last:
                 self.seq += 1
                 
-            await asyncio.sleep(self.segment_duration / 1000)
+            await asyncio.sleep(self.segment_duration / 1000) # 逐个发送，间隔时间模拟实时流
+            # 让出控制权，允许接受消息
             yield
             
     async def recv_messages(self) -> AsyncGenerator[AsrResponse, None]:
@@ -405,6 +434,7 @@ class AsrWsClient:
             async for _ in self.send_messages(segment_size, content):
                 pass
                 
+        # 启动发送和接收任务
         sender_task = asyncio.create_task(sender())
         
         try:
@@ -440,14 +470,19 @@ class AsrWsClient:
         self.seq = 1
         
         try:
+            # 1. 读取音频文件
             content = await self.read_audio_data(file_path)
             
+            # 2. 计算分段大小
             segment_size = self.get_segment_size(content)
             
+            # 3. 创建WebSocket连接
             await self.create_connection()
             
+            # 4. 发送完整客户端请求
             await self.send_full_client_request()
             
+            # 5. 启动音频流处理
             async for response in self.start_audio_stream(segment_size, content):
                 yield response
                 
@@ -458,103 +493,31 @@ class AsrWsClient:
             if self.conn:
                 await self.conn.close()
 
-class ApiKeyManager:
-    def __init__(self, keys_config: str):
-        self.keys = json.loads(keys_config)
-        self.semaphores = {}
-        for key in self.keys:
-            self.semaphores[key['key_id']] = asyncio.Semaphore(key['max_concurrent'])
-        self.total_concurrent = sum(key['max_concurrent'] for key in self.keys)
-        self.request_queue = asyncio.Queue()
-        self.key_index = 0
-        self.lock = asyncio.Lock()
-        
-    async def acquire_key(self) -> Dict[str, Any]:
-        async with self.lock:
-            for _ in range(len(self.keys)):
-                key = self.keys[self.key_index]
-                self.key_index = (self.key_index + 1) % len(self.keys)
-                semaphore = self.semaphores[key['key_id']]
-                if semaphore._value > 0:
-                    await semaphore.acquire()
-                    logger.info(f"Acquired key: {key['key_id']}, remaining: {semaphore._value}")
-                    return key
-                    
-        key = self.keys[self.key_index]
-        self.key_index = (self.key_index + 1) % len(self.keys)
-        semaphore = self.semaphores[key['key_id']]
-        await semaphore.acquire()
-        logger.info(f"Acquired key (waited): {key['key_id']}, remaining: {semaphore._value}")
-        return key
-        
-    def release_key(self, key: Dict[str, Any]):
-        semaphore = self.semaphores[key['key_id']]
-        semaphore.release()
-        logger.info(f"Released key: {key['key_id']}, available: {semaphore._value}")
-
-class AsrRequest(BaseModel):
-    file_path: str = "d:/test.wav"
-    url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
-    seg_duration: int = 200
-
-app = FastAPI(title="ASR Streaming API", version="1.0.0")
-
-key_manager = None
-
-@app.on_event("startup")
-async def startup_event():
-    global key_manager
-    key_manager = ApiKeyManager(VOLC_KEYS_CONFIG)
-    logger.info(f"API Key Manager initialized with {len(key_manager.keys)} keys, total concurrent: {key_manager.total_concurrent}")
-
-@app.post("/api/v1/asr/streaming")
-async def streaming_asr(request: AsrRequest):
-    global key_manager
+async def main():
+    import argparse
     
-    if not os.path.exists(request.file_path):
-        raise HTTPException(status_code=400, detail=f"Audio file not found: {request.file_path}")
-    
-    key = await key_manager.acquire_key()
-    
-    try:
-        results = []
-        async with AsrWsClient(
-            url=request.url,
-            app_key=key['app_key'],
-            access_key=key['access_key'],
-            segment_duration=request.seg_duration
-        ) as client:
-            async for response in client.execute(request.file_path):
-                results.append(response.to_dict())
-                logger.info(f"Received response: {json.dumps(response.to_dict(), ensure_ascii=False)}")
-        
-        return {
-            "status": "success",
-            "key_id": key['key_id'],
-            "results": results
-        }
-    except Exception as e:
-        logger.error(f"ASR processing failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        key_manager.release_key(key)
+    parser = argparse.ArgumentParser(description="ASR WebSocket Client")
+    parser.add_argument("--file", type=str, required=True, help="Audio file path")
 
-@app.get("/api/v1/asr/status")
-async def get_status():
-    global key_manager
-    status = {
-        "total_keys": len(key_manager.keys),
-        "total_concurrent": key_manager.total_concurrent,
-        "keys": []
-    }
-    for key in key_manager.keys:
-        semaphore = key_manager.semaphores[key['key_id']]
-        status["keys"].append({
-            "key_id": key['key_id'],
-            "max_concurrent": key['max_concurrent'],
-            "available": semaphore._value
-        })
-    return status
+    #wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
+    #wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
+    #wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream
+    parser.add_argument("--url", type=str, default="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream", 
+                       help="WebSocket URL")
+    parser.add_argument("--seg-duration", type=int, default=200, 
+                       help="Audio duration(ms) per packet, default:200")
+    
+    args = parser.parse_args()
+    
+    async with AsrWsClient(args.url, args.seg_duration) as client:  # 使用async with
+        try:
+            async for response in client.execute(args.file):
+                logger.info(f"Received response: {json.dumps(response.to_dict(), indent=2, ensure_ascii=False)}")
+        except Exception as e:
+            logger.error(f"ASR processing failed: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8005)
+    asyncio.run(main())
+
+    # 用法：
+    # python3 sauc_websocket_demo.py --file /Users/bytedance/code/python/eng_ddc_itn.wav
