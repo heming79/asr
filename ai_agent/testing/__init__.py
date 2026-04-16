@@ -8,7 +8,8 @@ from .test_engine import (
     TestResult,
     TestStatus,
     TestSuite,
-    TestGenerator
+    TestGenerator,
+    TestType
 )
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "TestResult",
     "TestStatus",
     "TestSuite",
-    "TestGenerator"
+    "TestGenerator",
+    "TestType"
 ]

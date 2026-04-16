@@ -7,7 +7,8 @@ from .diagnostics import (
     LogEntry,
     DiagnosticResult,
     RepairAction,
-    LogAnalyzer
+    LogAnalyzer,
+    LogLevel
 )
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "LogEntry",
     "DiagnosticResult",
     "RepairAction",
-    "LogAnalyzer"
+    "LogAnalyzer",
+    "LogLevel"
 ]
